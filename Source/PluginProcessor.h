@@ -33,14 +33,24 @@ public:
     void getStateInformation (juce::MemoryBlock& destData) override;
     void setStateInformation (const void* data, int sizeInBytes) override;
 
+    static juce::String bandParamId (int band) { return "band" + juce::String (band + 1); }
+    static juce::String bandName (int band);
+
     juce::AudioProcessorValueTreeState params;
+    mcd::Denoiser denoiser;
+
+    /** Set by the editor's Learn button (not automatable). */
+    std::atomic<bool> learning { false };
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
 
-    std::array<mcd::ChannelDenoiser, 2> denoisers;
-    std::atomic<float>* strength = nullptr;
+    std::atomic<float>* threshold = nullptr;
+    std::atomic<float>* reduction = nullptr;
+    std::atomic<float>* smoothing = nullptr;
+    std::atomic<float>* mode = nullptr;
     std::atomic<float>* noiseOnly = nullptr;
+    std::array<std::atomic<float>*, mcd::NUM_BANDS> bands {};
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (DenoiseProcessor)
 };

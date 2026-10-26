@@ -7,19 +7,42 @@ DenoiseProcessor::DenoiseProcessor()
                           .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       params (*this, nullptr, "MajorCircleDenoise", createLayout())
 {
-    strength = params.getRawParameterValue ("strength");
+    threshold = params.getRawParameterValue ("threshold");
+    reduction = params.getRawParameterValue ("reduction");
+    smoothing = params.getRawParameterValue ("smoothing");
+    mode = params.getRawParameterValue ("mode");
     noiseOnly = params.getRawParameterValue ("noiseOnly");
+    for (int b = 0; b < mcd::NUM_BANDS; ++b)
+        bands[(size_t) b] = params.getRawParameterValue (bandParamId (b));
+}
+
+juce::String DenoiseProcessor::bandName (int band)
+{
+    const double f = mcd::BAND_FREQS[band];
+    return f >= 1000.0 ? juce::String (f / 1000.0, f < 10000.0 && std::fmod (f, 1000.0) != 0.0 ? 1 : 0) + "k"
+                       : juce::String ((int) f);
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout DenoiseProcessor::createLayout()
 {
+    using Range = juce::NormalisableRange<float>;
+    auto db = juce::AudioParameterFloatAttributes().withLabel ("dB");
+    auto percent = juce::AudioParameterFloatAttributes().withLabel ("%");
+
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
-    layout.add (std::make_unique<juce::AudioParameterFloat> (
-        juce::ParameterID { "strength", 1 }, "Strength",
-        juce::NormalisableRange<float> (0.0f, 100.0f, 1.0f), 50.0f,
-        juce::AudioParameterFloatAttributes().withLabel ("%")));
-    layout.add (std::make_unique<juce::AudioParameterBool> (
-        juce::ParameterID { "noiseOnly", 1 }, "Listen to Noise", false));
+    layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "threshold", 2 }, "Threshold",
+                                                             Range (-10.0f, 20.0f, 0.1f), 3.0f, db));
+    layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "reduction", 2 }, "Reduction",
+                                                             Range (0.0f, 60.0f, 0.1f), 20.0f, db));
+    layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "smoothing", 2 }, "Smoothing",
+                                                             Range (0.0f, 100.0f, 1.0f), 50.0f, percent));
+    for (int b = 0; b < mcd::NUM_BANDS; ++b)
+        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { bandParamId (b), 2 },
+                                                                 "Band " + bandName (b) + " Hz",
+                                                                 Range (0.0f, 100.0f, 1.0f), 100.0f, percent));
+    layout.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { "mode", 2 }, "Noise Profile",
+                                                              juce::StringArray { "Auto", "Learned" }, 0));
+    layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { "noiseOnly", 2 }, "Listen to Noise", false));
     return layout;
 }
 
@@ -33,8 +56,7 @@ bool DenoiseProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 
 void DenoiseProcessor::prepareToPlay (double sampleRate, int)
 {
-    for (auto& d : denoisers)
-        d.prepare (sampleRate);
+    denoiser.prepare (sampleRate, juce::jlimit (1, mcd::MAX_CHANNELS, getMainBusNumOutputChannels()));
     setLatencySamples (mcd::FRAME_SIZE);
 }
 
@@ -48,12 +70,19 @@ void DenoiseProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
 {
     juce::ScopedNoDenormals noDenormals;
 
-    const double strengthPercent = strength->load();
-    const bool listenToNoise = noiseOnly->load() > 0.5f;
-    const int numChannels = juce::jmin (buffer.getNumChannels(), (int) denoisers.size());
+    mcd::Params p;
+    p.thresholdDb = threshold->load();
+    p.reductionDb = reduction->load();
+    p.smoothing = smoothing->load();
+    for (int b = 0; b < mcd::NUM_BANDS; ++b)
+        p.bandAmount[(size_t) b] = bands[(size_t) b]->load();
+    p.useLearned = mode->load() > 0.5f;
+    p.learning = learning.load();
+    p.noiseOnly = noiseOnly->load() > 0.5f;
+    denoiser.setParams (p);
 
-    for (int ch = 0; ch < numChannels; ++ch)
-        denoisers[(size_t) ch].process (buffer.getWritePointer (ch), buffer.getNumSamples(), strengthPercent, listenToNoise);
+    if (buffer.getNumChannels() >= juce::jlimit (1, mcd::MAX_CHANNELS, getMainBusNumOutputChannels()))
+        denoiser.process (buffer.getArrayOfWritePointers(), buffer.getNumSamples());
 }
 
 juce::AudioProcessorEditor* DenoiseProcessor::createEditor()
@@ -63,15 +92,36 @@ juce::AudioProcessorEditor* DenoiseProcessor::createEditor()
 
 void DenoiseProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
-    if (auto xml = params.copyState().createXml())
+    auto state = params.copyState();
+    const auto profile = denoiser.getLearnedProfile();
+    state.setProperty ("noiseProfile",
+                       profile.empty() ? juce::String()
+                                       : juce::MemoryBlock (profile.data(), profile.size() * sizeof (float)).toBase64Encoding(),
+                       nullptr);
+    if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
 }
 
 void DenoiseProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
-    if (auto xml = getXmlFromBinary (data, sizeInBytes))
-        if (xml->hasTagName (params.state.getType()))
-            params.replaceState (juce::ValueTree::fromXml (*xml));
+    auto xml = getXmlFromBinary (data, sizeInBytes);
+    if (xml == nullptr || ! xml->hasTagName (params.state.getType()))
+        return;
+
+    auto state = juce::ValueTree::fromXml (*xml);
+    juce::MemoryBlock block;
+    if (block.fromBase64Encoding (state.getProperty ("noiseProfile").toString()) && block.getSize() > 0)
+    {
+        std::vector<float> profile (block.getSize() / sizeof (float));
+        std::memcpy (profile.data(), block.getData(), profile.size() * sizeof (float));
+        denoiser.setLearnedProfile (profile);
+    }
+    else
+    {
+        denoiser.clearLearnedProfile();
+    }
+    state.removeProperty ("noiseProfile", nullptr);
+    params.replaceState (state);
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
