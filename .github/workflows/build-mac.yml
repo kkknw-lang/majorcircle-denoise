@@ -1,0 +1,64 @@
+name: Build macOS plugin
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (universal: Apple Silicon + Intel)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+
+      - name: Build
+        run: cmake --build build --config Release --target MajorCircleDenoise_AU MajorCircleDenoise_VST3 DenoiseCoreTest -j 4
+
+      - name: DSP tests
+        run: ./build/DenoiseCoreTest
+
+      - name: Sign (ad-hoc) and install for validation
+        run: |
+          AU="build/MajorCircleDenoise_artefacts/Release/AU/MajorCircle Denoise.component"
+          VST3="build/MajorCircleDenoise_artefacts/Release/VST3/MajorCircle Denoise.vst3"
+          codesign --force --deep --sign - "$AU"
+          codesign --force --deep --sign - "$VST3"
+          lipo -info "$AU/Contents/MacOS/MajorCircle Denoise"
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          cp -R "$AU" ~/Library/Audio/Plug-Ins/Components/
+          killall -9 AudioComponentRegistrar || true
+
+      - name: Validate with Apple auval (what Logic checks)
+        run: auval -v aufx Mdns Mjcr
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp -R "build/MajorCircleDenoise_artefacts/Release/AU/MajorCircle Denoise.component" dist/
+          cp -R "build/MajorCircleDenoise_artefacts/Release/VST3/MajorCircle Denoise.vst3" dist/
+          cp INSTALL_KO.md dist/설치방법.md
+          cd dist && ditto -c -k --sequesterRsrc . ../MajorCircle-Denoise-mac.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MajorCircle-Denoise-mac
+          path: MajorCircle-Denoise-mac.zip
+
+      - name: Publish to the Releases page
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest MajorCircle-Denoise-mac.zip \
+            --title "MajorCircle Denoise (최신 빌드)" \
+            --notes "Logic Pro용 Audio Unit(.component)과 VST3. 설치 방법은 압축 파일 안의 설치방법.md를 보세요." \
+            --target "${{ github.sha }}"
